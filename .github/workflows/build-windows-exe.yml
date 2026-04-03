@@ -30,12 +30,13 @@ jobs:
           if (-not (Test-Path -Path 'dist')) { New-Item -ItemType Directory -Path 'dist' | Out-Null }
           if (-not (Test-Path -Path 'build')) { New-Item -ItemType Directory -Path 'build' | Out-Null }
           if (-not (Test-Path -Path 'generated')) { New-Item -ItemType Directory -Path 'generated' | Out-Null }
-          if (-not (Test-Path -Path 'brain_data.txt')) { '{}' | Out-File -FilePath 'brain_data.txt' -Encoding utf8 }
+          if (-not (Test-Path -Path 'brain_data.txt')) { '' | Out-File -FilePath 'brain_data.txt' -Encoding utf8 }
 
-      - name: Run PyInstaller to create single-file EXE (cmd shell)
+      - name: Run PyInstaller to create single-file GUI EXE (cmd shell)
         shell: cmd
         run: |
           pyinstaller --noconfirm --onefile --clean --name neuro-trace-gen ^
+            --noconsole ^
             --add-data "brain_data.txt;." ^
             --add-data "generated;generated" ^
             main.py
@@ -50,15 +51,16 @@ jobs:
             Write-Host "EXE built: dist\neuro-trace-gen.exe"
           }
 
-      - name: Run smoke test on EXE (cmd shell)
-        shell: cmd
+      - name: Smoke test using Python (do not run GUI exe in CI)
+        shell: pwsh
         run: |
-          dist\neuro-trace-gen.exe generate test_out.png
-          if not exist test_out.png (
-            echo "WARNING: smoke test did not produce test_out.png; check logs"
-          ) else (
-            echo "Smoke test produced test_out.png"
-          )
+          python - <<'PY'
+          from main import Generator
+          g = Generator(width=64, height=64)
+          out = 'test_out.png'
+          g.generate_to_path(out)
+          print('Smoke test generated', out)
+          PY
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
