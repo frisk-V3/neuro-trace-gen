@@ -1,38 +1,40 @@
 #!/usr/bin/env python3
 """
 main.py
-画像トレース -> brain_data.txt 保存 -> brainから自律生成
-PyInstaller 実行時のリソースパス対応と不完全データ耐性を追加した単一ファイル実装
+GUI専用: 画像トレース -> brain_data.txt 保存 -> brainから自律生成
+トレース時に1回生成、裏で100回学習（daemon thread）
+PyInstaller バンドル対応（sys._MEIPASS）
 """
 
 import os
 import sys
 import json
 import time
-import math
 import random
+import threading
 from datetime import datetime
-from tkinter import Tk, Button, Label, filedialog, messagebox
+from collections import Counter
+
+# 画像処理・数値計算・ノイズ
 from PIL import Image, ImageOps, ImageFilter
 import numpy as np
 from noise import pnoise2
-from collections import Counter
 
 # ---------------------------
 # PyInstaller 対応: バンドル内リソースの base path 解決
 # ---------------------------
 if getattr(sys, "frozen", False):
-    # PyInstaller bundle
     base_path = sys._MEIPASS
 else:
     base_path = os.path.dirname(os.path.abspath(__file__))
 
 BRAIN_FILE = os.path.join(base_path, "brain_data.txt")
+# GENERATED_DIR はもはや自動出力先に使わないがフォルダは保持
 GENERATED_DIR = os.path.join(base_path, "generated")
 os.makedirs(GENERATED_DIR, exist_ok=True)
 
 # ---------------------------
-# 設定
+# デフォルトテンプレート
 # ---------------------------
 DEFAULT_BRAIN_TEMPLATE = {
     "avg_color": [128, 128, 128],
@@ -47,16 +49,10 @@ def now_ts():
     return datetime.utcnow().isoformat() + "Z"
 
 def _is_valid_brain_entry(entry: dict) -> bool:
-    # 必須キーの存在チェック（最低限）
     if not isinstance(entry, dict):
         return False
-    if "avg_color" not in entry:
+    if "avg_color" not in entry or "dominant_colors" not in entry or "mood" not in entry:
         return False
-    if "dominant_colors" not in entry:
-        return False
-    if "mood" not in entry:
-        return False
-    # 型チェック（簡易）
     try:
         _ = list(entry["avg_color"])
         _ = list(entry["dominant_colors"])
@@ -66,15 +62,13 @@ def _is_valid_brain_entry(entry: dict) -> bool:
     return True
 
 def save_brain_entry(entry: dict):
-    # 保存前に最低限のフィールドを補完する
-    e = dict(entry)  # shallow copy
+    e = dict(entry)
     if "avg_color" not in e:
         e["avg_color"] = DEFAULT_BRAIN_TEMPLATE["avg_color"]
     if "dominant_colors" not in e:
         e["dominant_colors"] = DEFAULT_BRAIN_TEMPLATE["dominant_colors"]
     if "mood" not in e:
         e["mood"] = DEFAULT_BRAIN_TEMPLATE["mood"]
-    # timestamp と source がなければ付与
     if "timestamp" not in e:
         e["timestamp"] = now_ts()
     if "source" not in e:
@@ -86,7 +80,6 @@ def load_brain_entries():
     if not os.path.exists(BRAIN_FILE):
         return []
     entries = []
-    skipped = 0
     with open(BRAIN_FILE, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -95,13 +88,9 @@ def load_brain_entries():
             try:
                 obj = json.loads(line)
             except Exception:
-                skipped += 1
                 continue
             if _is_valid_brain_entry(obj):
                 entries.append(obj)
-            else:
-                skipped += 1
-    # optional: if all entries skipped, return empty list
     return entries
 
 # ---------------------------
@@ -167,11 +156,7 @@ class Tracer:
         warmth = float(avg[0] - avg[2])
         contrast = float(brightness["max"] - brightness["min"])
         complexity = float(self.edge_density())
-        return {
-            "warmth": warmth,
-            "contrast": contrast,
-            "complexity": complexity
-        }
+        return {"warmth": warmth, "contrast": contrast, "complexity": complexity}
 
     def extract_all(self):
         data = {
@@ -184,7 +169,6 @@ class Tracer:
             "dominant_colors": self.dominant_colors(n=3),
             "mood": self.mood_vector()
         }
-        # mood_text: 簡易説明
         mood = data["mood"]
         mood_desc = []
         if mood["warmth"] > 0.05:
@@ -213,7 +197,6 @@ class Generator:
         self.height = height
 
     def _aggregate_brain(self, entries):
-        # entries は load_brain_entries() により既に検証済みの想定だが二重防御
         valid = [e for e in entries if _is_valid_brain_entry(e)]
         if not valid:
             return {
@@ -221,10 +204,8 @@ class Generator:
                 "palette": DEFAULT_BRAIN_TEMPLATE["dominant_colors"],
                 "mood": DEFAULT_BRAIN_TEMPLATE["mood"]
             }
-        # avg_color 平均化
         avg_colors = np.array([e["avg_color"] for e in valid], dtype=float)
         avg_color = np.mean(avg_colors, axis=0).astype(int).tolist()
-        # palette 集約
         palette = []
         for e in valid:
             for c in e.get("dominant_colors", []):
@@ -236,7 +217,6 @@ class Generator:
         most = [list(c) for c,_ in cnt.most_common(5)]
         if not most:
             most = [avg_color]
-        # mood 平均
         moods = np.array([[e.get("mood",{}).get("warmth",0.0),
                            e.get("mood",{}).get("contrast",0.0),
                            e.get("mood",{}).get("complexity",0.0)] for e in valid], dtype=float)
@@ -282,7 +262,7 @@ class Generator:
             img[mask] = col.astype(np.uint8)
         return Image.fromarray(img)
 
-    def generate(self, out_name=None, width=None, height=None):
+    def generate_to_path(self, out_path, width=None, height=None):
         if width: self.width = width
         if height: self.height = height
         entries = load_brain_entries()
@@ -322,98 +302,107 @@ class Generator:
         elif complexity > 0.7:
             img = img.filter(ImageFilter.DETAIL)
 
-        if out_name is None:
-            out_name = f"gen_{int(time.time())}.png"
-        out_path = os.path.join(GENERATED_DIR, out_name)
         img.save(out_path)
         return out_path, params, agg
 
 # ---------------------------
-# GUI: tkinter
+# バックグラウンド学習（トレース後に100回）
 # ---------------------------
-class App:
-    def __init__(self, root):
-        self.root = root
-        root.title("Image Tracer & Brain Generator")
-        root.geometry("420x160")
-        Label(root, text="画像トレース -> brain_data.txt に保存\nbrain から自律生成", justify="left").pack(pady=8)
-
-        self.trace_btn = Button(root, text="画像を選択してトレース", width=30, command=self.trace_image)
-        self.trace_btn.pack(pady=6)
-
-        self.gen_btn = Button(root, text="脳から生成", width=30, command=self.generate_from_brain)
-        self.gen_btn.pack(pady=6)
-
-        self.status = Label(root, text="status: ready", anchor="w")
-        self.status.pack(fill="x", padx=8, pady=6)
-
-    def trace_image(self):
-        path = filedialog.askopenfilename(filetypes=[("PNG images","*.png"),("All files","*.*")])
-        if not path:
-            return
-        try:
-            tracer = Tracer(path)
-            data = tracer.extract_all()
-            save_brain_entry(data)
-            self.status.config(text=f"status: traced and saved ({os.path.basename(path)})")
-            messagebox.showinfo("Traced", f"トレース完了: {os.path.basename(path)}\n保存先: {BRAIN_FILE}")
-        except Exception as e:
-            messagebox.showerror("Error", f"トレース中にエラーが発生しました:\n{e}")
-
-    def generate_from_brain(self):
-        try:
-            gen = Generator(width=512, height=512)
-            out_path, params, agg = gen.generate()
-            self.status.config(text=f"status: generated {os.path.basename(out_path)}")
-            messagebox.showinfo("Generated", f"生成完了: {out_path}")
-        except Exception as e:
-            messagebox.showerror("Error", f"生成中にエラーが発生しました:\n{e}")
+def background_learning_simulation(base_entry: dict, iterations: int = 100, delay: float = 0.01):
+    def worker():
+        for i in range(iterations):
+            e = dict(base_entry)
+            # small random perturbations to mood and palette to simulate learning
+            mood = dict(e.get("mood", DEFAULT_BRAIN_TEMPLATE["mood"]))
+            mood["warmth"] = mood.get("warmth", 0.0) + random.uniform(-0.02, 0.02)
+            mood["contrast"] = max(0.0, mood.get("contrast", 0.0) + random.uniform(-0.02, 0.02))
+            mood["complexity"] = max(0.0, mood.get("complexity", 0.0) + random.uniform(-0.02, 0.02))
+            e["mood"] = mood
+            # slightly mutate dominant colors
+            new_palette = []
+            for c in e.get("dominant_colors", []):
+                try:
+                    nc = [int(max(0, min(255, x + random.randint(-6, 6)))) for x in c]
+                    new_palette.append(nc)
+                except Exception:
+                    new_palette.append(c)
+            e["dominant_colors"] = new_palette
+            e["timestamp"] = now_ts()
+            e["source"] = f"simulated_learning_{i}"
+            save_brain_entry(e)
+            time.sleep(delay)
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    return t
 
 # ---------------------------
-# CLI補助: コマンドラインからも利用可能
+# GUI: tkinter をここでインポート（ヘッドレス環境での import を安全にするため）
 # ---------------------------
-def cli_trace(path):
-    tracer = Tracer(path)
-    data = tracer.extract_all()
-    save_brain_entry(data)
-    print("Traced and saved:", data["source"])
+def launch_gui():
+    from tkinter import Tk, Button, Label, filedialog, messagebox
 
-def cli_generate(out_name=None):
-    gen = Generator(width=512, height=512)
-    out_path, params, agg = gen.generate(out_name=out_name)
-    print("Generated:", out_path)
-    print("Params:", params)
-    print("Agg:", agg)
+    class App:
+        def __init__(self, root):
+            self.root = root
+            root.title("neuro-trace-gen — Image Tracer & Brain Generator")
+            root.geometry("480x200")
+            Label(root, text="画像トレース -> brain_data.txt に保存\nトレース時に1回生成、裏で100回学習（非同期）", justify="left").pack(pady=8)
+
+            self.trace_btn = Button(root, text="画像を選択してトレース", width=36, command=self.trace_image)
+            self.trace_btn.pack(pady=6)
+
+            self.gen_btn = Button(root, text="脳から生成（保存先を選択）", width=36, command=self.generate_from_brain)
+            self.gen_btn.pack(pady=6)
+
+            self.status = Label(root, text="status: ready", anchor="w")
+            self.status.pack(fill="x", padx=8, pady=6)
+
+        def trace_image(self):
+            path = filedialog.askopenfilename(filetypes=[("PNG images","*.png"),("All files","*.*")])
+            if not path:
+                return
+            try:
+                tracer = Tracer(path)
+                data = tracer.extract_all()
+                save_brain_entry(data)
+                # トレース直後に1回だけ生成: 保存先をユーザーに選ばせる
+                save_path = filedialog.asksaveasfilename(defaultextension=".png", filetypes=[("PNG","*.png")], initialfile=f"gen_{int(time.time())}.png")
+                if save_path:
+                    gen = Generator(width=512, height=512)
+                    out_path, params, agg = gen.generate_to_path(save_path)
+                    messagebox.showinfo("Generated", f"トレース後の1回生成を保存しました:\n{out_path}")
+                else:
+                    messagebox.showinfo("Traced", f"トレース完了（生成はスキップ）:\n{os.path.basename(path)}")
+
+                # 裏で100回学習を開始（非同期）
+                background_learning_simulation(data, iterations=100, delay=0.01)
+                self.status.config(text=f"status: traced and learning started ({os.path.basename(path)})")
+            except Exception as e:
+                messagebox.showerror("Error", f"トレース中にエラーが発生しました:\n{e}")
+
+        def generate_from_brain(self):
+            try:
+                save_path = filedialog.asksaveasfilename(defaultextension=".png", filetypes=[("PNG","*.png")], initialfile=f"gen_{int(time.time())}.png")
+                if not save_path:
+                    return
+                gen = Generator(width=512, height=512)
+                out_path, params, agg = gen.generate_to_path(save_path)
+                self.status.config(text=f"status: generated {os.path.basename(out_path)}")
+                messagebox.showinfo("Generated", f"生成完了: {out_path}")
+            except Exception as e:
+                messagebox.showerror("Error", f"生成中にエラーが発生しました:\n{e}")
+
+    root = Tk()
+    app = App(root)
+    root.mainloop()
 
 # ---------------------------
-# エントリポイント
+# エントリポイント（GUI専用）
 # ---------------------------
 if __name__ == "__main__":
-    # ensure brain file exists but do not write invalid JSON object
+    # brain file がなければ空ファイルを作成（無効な JSON は書き込まない）
     if not os.path.exists(BRAIN_FILE):
         open(BRAIN_FILE, "a", encoding="utf-8").close()
 
-    if len(sys.argv) >= 2:
-        cmd = sys.argv[1]
-        if cmd == "trace" and len(sys.argv) >= 3:
-            try:
-                cli_trace(sys.argv[2])
-            except Exception as e:
-                print("Trace error:", e)
-                sys.exit(1)
-        elif cmd == "generate":
-            out = sys.argv[2] if len(sys.argv) >= 3 else None
-            try:
-                cli_generate(out)
-            except Exception as e:
-                print("Generate error:", e)
-                sys.exit(1)
-        else:
-            print("Usage:")
-            print("  python main.py                # GUI mode")
-            print("  python main.py trace path.png")
-            print("  python main.py generate [out.png]")
-    else:
-        root = Tk()
-        app = App(root)
-        root.mainloop()
+    # 常に GUI を起動（CLI は無効）
+    launch_gui()
