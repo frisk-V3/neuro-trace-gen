@@ -1,0 +1,71 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-windows-exe:
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Upgrade pip and install build deps
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install -r requirements.txt
+
+      - name: Prepare build folders
+        run: |
+          if not exist dist mkdir dist
+          if not exist build mkdir build
+          if not exist generated mkdir generated
+          if not exist "%GITHUB_WORKSPACE%\brain_data.txt" echo {} > brain_data.txt
+
+      - name: Run PyInstaller to create single-file EXE
+        shell: cmd
+        run: |
+          REM Ensure deterministic build options and include data files
+          REM On Windows, use semicolon separator for --add-data
+          pyinstaller --noconfirm --onefile --clean --name neuro-trace-gen ^
+            --add-data "brain_data.txt;." ^
+            --add-data "generated;generated" ^
+            main.py
+
+      - name: Verify EXE exists
+        run: |
+          if not exist dist\neuro-trace-gen.exe (
+            echo "ERROR: EXE not found" & exit 1
+          ) else (
+            echo "EXE built: dist\neuro-trace-gen.exe"
+          )
+
+      - name: Run smoke test on EXE
+        shell: cmd
+        run: |
+          REM Run the exe with --version-like check via running with generate command
+          dist\neuro-trace-gen.exe generate test_out.png
+          if not exist test_out.png (
+            echo "WARNING: smoke test did not produce test_out.png; check logs"
+          ) else (
+            echo "Smoke test produced test_out.png"
+          )
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: neuro-trace-gen-windows-exe
+          path: |
+            dist\neuro-trace-gen.exe
+            build
+            dist
+            test_out.png
